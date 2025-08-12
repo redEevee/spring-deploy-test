@@ -2,20 +2,18 @@ name: Deploy
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
 
 permissions:
   contents: read
   packages: write
 
-env:
-  IMAGE_NAME: spring-backend
-  DOCKER_IMAGE: ghcr.io/${{ github.repository_owner }}/spring-backend:latest
-
 jobs:
   build:
     name: build-app
     runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }} # ← deploy에서 쓰기 위해 export
     steps:
       - uses: actions/checkout@v4
 
@@ -34,21 +32,29 @@ jobs:
       - name: Build with Gradle
         run: ./gradlew clean build -x test
 
-      # 멀티아키텍처 빌드 준비
+      # (선택) 멀티아키 필요 시 활성화
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Build & Push (multi-arch)
+      # 🟢 owner를 소문자로 만들고, DOCKER_IMAGE를 표준화
+      - name: Set image tag (lowercase owner)
+        run: |
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "DOCKER_IMAGE=ghcr.io/${OWNER_LC}/spring-backend:latest" >> $GITHUB_ENV
+      - name: Export image tag to job outputs
+        id: meta
+        run: echo "image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
+
+      - name: Build & Push
         run: |
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
-            -t ${{ env.DOCKER_IMAGE }} \
+            -t "${DOCKER_IMAGE}" \
             -f Dockerfile \
             --push .
 
@@ -56,6 +62,8 @@ jobs:
     needs: build
     name: Deploy
     runs-on: [self-hosted, deploy-spring-test]
+    env:
+      DOCKER_IMAGE: ${{ needs.build.outputs.image }} # ← build에서 만든 동일 태그 사용
     steps:
       - name: Deploy to Production (SSH into EC2)
         uses: appleboy/ssh-action@v1
@@ -69,10 +77,10 @@ jobs:
             cd /home/ec2-user/spring-deploy-test
             docker-compose down || true
 
-            # EC2에서 GHCR에 pull 하려면 PAT 필요 (read:packages 권한)
+            # EC2에서 GHCR pull → PAT 필요 (read:packages 이상)
             echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u ${{ secrets.ACTOR }} --password-stdin
 
-            docker pull ${{ env.DOCKER_IMAGE }}
+            docker pull "${DOCKER_IMAGE}"
             docker image prune -f
             docker logout
 
