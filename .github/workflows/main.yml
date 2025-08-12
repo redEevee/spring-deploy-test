@@ -111,17 +111,50 @@ jobs:
         run: |
           set -Eeuo pipefail
           echo "Starting Backend Production Deployment"
+
+          # 0) Compose 커맨드 확정 (먼저!)
+          if sudo docker compose version >/dev/null 2>&1; then
+            COMPOSE_CMD="sudo docker compose"
+          elif command -v docker-compose >/dev/null 2>&1; then
+            COMPOSE_CMD="sudo docker-compose"
+          else
+            echo "::error::Docker Compose not installed."; exit 1
+          fi
+          echo "[i] Using: $COMPOSE_CMD"
+
           cd /home/ec2-user/spring-deploy-test
 
+          # 1) .env 파일 생성 (heredoc 대신 printf로 YAML 충돌 방지)
+          printf '%s\n' \
+            "GITHUB_ACTOR=${{ secrets.GHCR_ACTOR }}" \
+            "DB_ROOT_PASSWORD=${{ secrets.DB_ROOT_PASSWORD }}" \
+            "DB_USER=${{ secrets.DB_USER }}" \
+            "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" \
+            "DB_NAME=${{ secrets.DB_NAME }}" \
+            "REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}" \
+            > .env
 
+          # 비어있는 시크릿 경고(값은 노출 안 함)
+          for k in GITHUB_ACTOR DB_ROOT_PASSWORD DB_USER DB_PASSWORD DB_NAME REDIS_PASSWORD; do
+            v=$(grep -E "^$k=" .env | cut -d= -f2-)
+            if [ -z "$v" ]; then
+              echo "::warning::Secret '$k' is empty or not set"
+            fi
+          done
 
-          # ④ 안전하게 down → pull → up (env-file 강제 전달)
+          # 2) GHCR 비대화식 로그인 (non-TTY 안전)
+          GHCR_ACTOR_LC="${{ secrets.GHCR_ACTOR }}"
+          GHCR_ACTOR_LC="${GHCR_ACTOR_LC,,}"
+          if [ -z "$GHCR_ACTOR_LC" ]; then
+            echo "::error::GHCR_ACTOR(secret)가 비어있습니다."; exit 1
+          fi
+          echo '${{ secrets.GHCR_TOKEN }}' | sudo docker login ghcr.io -u "$GHCR_ACTOR_LC" --password-stdin
+
+          # 3) 안전하게 down → pull → up (env-file 강제)
           $COMPOSE_CMD --env-file .env down || true
-
           sudo docker pull "${DOCKER_IMAGE}"
           sudo docker image prune -f || true
           sudo docker logout || true
-
           $COMPOSE_CMD --env-file .env up -d
 
           echo "[✓] Deploy finished"
