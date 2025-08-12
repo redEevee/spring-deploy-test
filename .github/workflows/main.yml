@@ -65,18 +65,74 @@ jobs:
     env:
       DOCKER_IMAGE: ${{ needs.build.outputs.image }}
     steps:
+      - name: Ensure Docker & Compose installed
+        shell: bash
+        run: |
+          set -e
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "[+] Installing Docker/Compose..."
+            source /etc/os-release || true
+            if [[ "$ID" == "amzn" && "$VERSION_ID" == "2023" ]]; then
+              sudo dnf -y update
+              sudo dnf -y install docker docker-compose-plugin
+              sudo systemctl enable --now docker
+            elif [[ "$ID" == "amzn" ]]; then
+              sudo yum -y update
+              sudo amazon-linux-extras install -y docker
+              sudo systemctl enable --now docker
+              # Compose v2 바이너리 대체 (AL2 호환)
+              if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
+                sudo curl -L "https://github.com/docker/compose/releases/download/v2.24.7/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+                sudo chmod +x /usr/local/bin/docker-compose
+              fi
+            elif [[ "$ID" == "ubuntu" ]]; then
+              sudo apt-get update -y
+              sudo apt-get install -y docker.io docker-compose-plugin
+              sudo systemctl enable --now docker
+            else
+              echo "Unsupported OS: $ID $VERSION_ID"; exit 1
+            fi
+          fi
+
+          echo "[i] Docker version:"
+          sudo docker --version || true
+          echo "[i] Docker Compose version:"
+          if sudo docker compose version >/dev/null 2>&1; then
+            sudo docker compose version
+          elif command -v docker-compose >/dev/null 2>&1; then
+            docker-compose version
+          else
+            echo "Compose not found after install"; exit 1
+          fi
+
+          # 현재 러너 계정을 도커 그룹에 추가(다음 실행부터 sudo 없이 가능)
+          if id -nG "$USER" | grep -qw docker; then
+            echo "[i] User already in docker group"
+          else
+            sudo usermod -aG docker "$USER" || true
+          fi
+
       - name: Deploy to Production
+        shell: bash
         run: |
           set -e
           echo "Starting Backend Production Deployment"
           cd /home/ec2-user/spring-deploy-test
-          docker-compose down || true
 
-          # GHCR pull: PAT 사용(읽기 권한 필요: read:packages)
-          echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ secrets.GHCR_ACTOR }} --password-stdin
+          # Compose v2 우선, 없으면 v1 사용
+          if sudo docker compose version >/dev/null 2>&1; then
+            COMPOSE_CMD="sudo docker compose"
+          else
+            COMPOSE_CMD="sudo docker-compose"
+          fi
 
-          docker pull "${DOCKER_IMAGE}"
-          docker image prune -f
-          docker logout
+          $COMPOSE_CMD down || true
 
-          docker-compose up -d
+          # GHCR pull (PAT 필요: read:packages 이상)
+          echo "${{ secrets.GHCR_TOKEN }}" | sudo docker login ghcr.io -u ${{ secrets.GHCR_ACTOR }} --password-stdin
+
+          sudo docker pull "${DOCKER_IMAGE}"
+          sudo docker image prune -f
+          sudo docker logout
+
+          $COMPOSE_CMD up -d
