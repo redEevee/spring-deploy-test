@@ -103,7 +103,6 @@ jobs:
             command -v docker-compose >/dev/null 2>&1 || { echo "[-] Compose install failed"; exit 1; }
           fi
 
-          # 다음 실행부터 sudo 없이 사용하려면(이번엔 sudo 사용)
           sudo usermod -aG docker "$USER" || true
 
       - name: Deploy to Production
@@ -112,7 +111,7 @@ jobs:
           set -Eeuo pipefail
           echo "Starting Backend Production Deployment"
 
-          # 0) Compose 커맨드 확정 (먼저!)
+          # 0) Compose 커맨드 확정
           if sudo docker compose version >/dev/null 2>&1; then
             COMPOSE_CMD="sudo docker compose"
           elif command -v docker-compose >/dev/null 2>&1; then
@@ -124,7 +123,13 @@ jobs:
 
           cd /home/ec2-user/spring-deploy-test
 
-          # 1) .env 파일 생성 (heredoc 대신 printf로 YAML 충돌 방지)
+          # 1) .env 디렉터리 충돌 회피 → compose.env 파일 사용
+          ENV_FILE="compose.env"
+          if [ -d ".env" ]; then
+            echo "::warning::.env is a directory. Using $ENV_FILE instead."
+          fi
+
+          # 2) env 파일 생성 (printf 사용)
           printf '%s\n' \
             "GITHUB_ACTOR=${{ secrets.GHCR_ACTOR }}" \
             "DB_ROOT_PASSWORD=${{ secrets.DB_ROOT_PASSWORD }}" \
@@ -132,29 +137,28 @@ jobs:
             "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" \
             "DB_NAME=${{ secrets.DB_NAME }}" \
             "REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}" \
-            > .env
+            > "$ENV_FILE"
 
-          # 비어있는 시크릿 경고(값은 노출 안 함)
+          # 비어있는 시크릿 경고(값 미노출)
           for k in GITHUB_ACTOR DB_ROOT_PASSWORD DB_USER DB_PASSWORD DB_NAME REDIS_PASSWORD; do
-            v=$(grep -E "^$k=" .env | cut -d= -f2-)
+            v=$(grep -E "^$k=" "$ENV_FILE" | cut -d= -f2-)
             if [ -z "$v" ]; then
               echo "::warning::Secret '$k' is empty or not set"
             fi
           done
 
-          # 2) GHCR 비대화식 로그인 (non-TTY 안전)
-          GHCR_ACTOR_LC="${{ secrets.GHCR_ACTOR }}"
-          GHCR_ACTOR_LC="${GHCR_ACTOR_LC,,}"
+          # 3) GHCR 비대화식 로그인
+          GHCR_ACTOR_LC="${{ secrets.GHCR_ACTOR }}"; GHCR_ACTOR_LC="${GHCR_ACTOR_LC,,}"
           if [ -z "$GHCR_ACTOR_LC" ]; then
             echo "::error::GHCR_ACTOR(secret)가 비어있습니다."; exit 1
           fi
           echo '${{ secrets.GHCR_TOKEN }}' | sudo docker login ghcr.io -u "$GHCR_ACTOR_LC" --password-stdin
 
-          # 3) 안전하게 down → pull → up (env-file 강제)
-          $COMPOSE_CMD --env-file .env down || true
+          # 4) 안전하게 down → pull → up (항상 --env-file 전달)
+          $COMPOSE_CMD --env-file "$ENV_FILE" down || true
           sudo docker pull "${DOCKER_IMAGE}"
           sudo docker image prune -f || true
           sudo docker logout || true
-          $COMPOSE_CMD --env-file .env up -d
+          $COMPOSE_CMD --env-file "$ENV_FILE" up -d
 
           echo "[✓] Deploy finished"
