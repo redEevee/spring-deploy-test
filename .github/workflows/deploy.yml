@@ -1,0 +1,144 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: build-app
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Create .env for CD Deploy
+        run: echo "${{ secrets.PRODUCTION_ENV }}" > .env
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build with Gradle
+        run: ./gradlew clean build -x test
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR (GITHUB_TOKEN)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Set image tag (lowercase owner)
+        id: meta
+        run: |
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER_LC}/spring-backend:latest"
+          echo "DOCKER_IMAGE=${IMAGE}" >> $GITHUB_ENV
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+
+      - name: Build & Push (multi-arch)
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -f Dockerfile \
+            -t "${DOCKER_IMAGE}" \
+            --push .
+
+  deploy:
+    needs: build
+    name: Deploy
+    runs-on: [self-hosted, deploy-spring-test]
+    env:
+      DOCKER_IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      - name: Install Docker & Compose (AL2023/Ubuntu)
+        shell: bash
+        run: |
+          set -e
+          source /etc/os-release || true
+
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "[+] Installing Docker engine..."
+            if [[ "$ID" == "amzn" && "$VERSION_ID" == "2023" ]]; then
+              sudo dnf -y update || true
+              sudo dnf -y install docker || true
+              if ! command -v docker >/dev/null 2>&1; then
+                curl -fsSL https://get.docker.com -o get-docker.sh
+                sudo sh get-docker.sh
+              fi
+              sudo systemctl enable --now docker
+            elif [[ "$ID" == "ubuntu" ]]; then
+              sudo apt-get update -y
+              sudo apt-get install -y docker.io docker-compose-plugin
+              sudo systemctl enable --now docker
+            else
+              echo "Unsupported OS: $ID $VERSION_ID"; exit 1
+            fi
+          fi
+
+          echo "[i] Docker version:"
+          sudo docker --version || true
+
+          echo "[i] Ensuring Compose availability..."
+          if sudo docker compose version >/dev/null 2>&1; then
+            echo "[i] docker compose available"
+          else
+            echo "[+] Installing standalone docker-compose binary..."
+            sudo curl -L "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            sudo chmod +x /usr/local/bin/docker-compose
+            command -v docker-compose >/dev/null 2>&1 || { echo "[-] Compose install failed"; exit 1; }
+          fi
+
+          # 다음 실행부터 sudo 없이 사용하려면(이번엔 sudo 사용)
+          sudo usermod -aG docker "$USER" || true
+
+      - name: Deploy to Production
+        shell: bash
+        run: |
+          set -e
+          echo "Starting Backend Production Deployment"
+          cd /home/ec2-user/spring-deploy-test
+
+          # compose에서 사용할 서버측 .env 생성 (Secrets 주입)
+          cat > .env <<EOF
+          GITHUB_ACTOR=${{ secrets.GHCR_ACTOR }}
+          DB_ROOT_PASSWORD=${{ secrets.DB_ROOT_PASSWORD }}
+          DB_USER=${{ secrets.DB_USER }}
+          DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+          DB_NAME=${{ secrets.DB_NAME }}
+          REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
+          EOF
+
+          # Compose v2 우선, 없으면 v1 사용
+          if sudo docker compose version >/dev/null 2>&1; then
+            COMPOSE_CMD="sudo docker compose"
+          else
+            COMPOSE_CMD="sudo docker-compose"
+          fi
+
+          $COMPOSE_CMD --env-file .env down || true
+
+          # GHCR 비대화식 로그인 (PAT: read:packages 이상)
+          GHCR_ACTOR_LC=$(echo "${{ secrets.GHCR_ACTOR }}" | tr '[:upper:]' '[:lower:]')
+          GHCR_TOKEN_VALUE='${{ secrets.GHCR_TOKEN }}'
+          sudo docker login ghcr.io -u "$GHCR_ACTOR_LC" --password-stdin <<< "$GHCR_TOKEN_VALUE"
+
+          # 이미지 pull & 기동
+          sudo docker pull "${DOCKER_IMAGE}"
+          sudo docker image prune -f
+          sudo docker logout
+
+          $COMPOSE_CMD --env-file .env up -d
