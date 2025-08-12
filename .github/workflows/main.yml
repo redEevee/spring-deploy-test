@@ -109,23 +109,19 @@ jobs:
       - name: Deploy to Production
         shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
           echo "Starting Backend Production Deployment"
           cd /home/ec2-user/spring-deploy-test
 
-          if sudo docker compose version >/dev/null 2>&1; then
-            COMPOSE_CMD="sudo docker compose"
-          else
-            COMPOSE_CMD="sudo docker-compose"
-          fi
 
-          $COMPOSE_CMD down || true
 
-          # GHCR pull: PAT 필요(read:packages 이상). GHCR_ACTOR = PAT 계정(소문자)
-          echo "${{ secrets.GHCR_TOKEN }}" | sudo docker login ghcr.io -u ${{ secrets.GHCR_ACTOR }} --password-stdin
+          # ④ 안전하게 down → pull → up (env-file 강제 전달)
+          $COMPOSE_CMD --env-file .env down || true
 
           sudo docker pull "${DOCKER_IMAGE}"
-          sudo docker image prune -f
-          sudo docker logout
+          sudo docker image prune -f || true
+          sudo docker logout || true
 
-          $COMPOSE_CMD up -d
+          $COMPOSE_CMD --env-file .env up -d
+
+          echo "[✓] Deploy finished"
